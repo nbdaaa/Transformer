@@ -17,9 +17,14 @@ class SummarizationDataset(Dataset):
         self.src_column = src_column
         self.tgt_column = tgt_column
 
-        self.sos_token = torch.tensor([tokenizer_tgt.token_to_id("[SOS]")], dtype=torch.int64)
-        self.eos_token = torch.tensor([tokenizer_tgt.token_to_id("[EOS]")], dtype=torch.int64)
-        self.pad_token = torch.tensor([tokenizer_tgt.token_to_id("[PAD]")], dtype=torch.int64)
+        # Precompute special tokens for faster processing
+        self.sos_token_id = tokenizer_tgt.token_to_id("[SOS]")
+        self.eos_token_id = tokenizer_tgt.token_to_id("[EOS]")
+        self.pad_token_id = tokenizer_tgt.token_to_id("[PAD]")
+        
+        self.sos_token = torch.tensor([self.sos_token_id], dtype=torch.int64)
+        self.eos_token = torch.tensor([self.eos_token_id], dtype=torch.int64)
+        self.pad_token = torch.tensor([self.pad_token_id], dtype=torch.int64)
 
     def __len__(self):
         return len(self.ds)
@@ -45,48 +50,39 @@ class SummarizationDataset(Dataset):
         enc_num_padding_tokens = self.src_seq_len - len(enc_input_tokens) - 2  # For SOS and EOS
         dec_num_padding_tokens = self.tgt_seq_len - len(dec_input_tokens) - 1  # Only add SOS to decoder input
 
-        # Add <s> and </s> token
-        encoder_input = torch.cat(
-            [
-                self.sos_token,
-                torch.tensor(enc_input_tokens, dtype=torch.int64),
-                self.eos_token,
-                torch.tensor([self.pad_token] * enc_num_padding_tokens, dtype=torch.int64),
-            ],
-            dim=0,
-        )
+        # Create tensors efficiently using pre-allocated memory
+        # Encoder input: [SOS] + tokens + [EOS] + padding
+        encoder_input = torch.empty(self.src_seq_len, dtype=torch.int64)
+        encoder_input[0] = self.sos_token_id
+        encoder_input[1:len(enc_input_tokens)+1] = torch.tensor(enc_input_tokens, dtype=torch.int64)
+        encoder_input[len(enc_input_tokens)+1] = self.eos_token_id
+        if enc_num_padding_tokens > 0:
+            encoder_input[len(enc_input_tokens)+2:] = self.pad_token_id
 
-        # Add only <s> token
-        decoder_input = torch.cat(
-            [
-                self.sos_token,
-                torch.tensor(dec_input_tokens, dtype=torch.int64),
-                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int64),
-            ],
-            dim=0,
-        )
+        # Decoder input: [SOS] + tokens + padding
+        decoder_input = torch.empty(self.tgt_seq_len, dtype=torch.int64)
+        decoder_input[0] = self.sos_token_id
+        decoder_input[1:len(dec_input_tokens)+1] = torch.tensor(dec_input_tokens, dtype=torch.int64)
+        if dec_num_padding_tokens > 0:
+            decoder_input[len(dec_input_tokens)+1:] = self.pad_token_id
 
-        # Add only </s> token
-        label = torch.cat(
-            [
-                torch.tensor(dec_input_tokens, dtype=torch.int64),
-                self.eos_token,
-                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int64),
-            ],
-            dim=0,
-        )
+        # Label: tokens + [EOS] + padding
+        label = torch.empty(self.tgt_seq_len, dtype=torch.int64)
+        label[:len(dec_input_tokens)] = torch.tensor(dec_input_tokens, dtype=torch.int64)
+        label[len(dec_input_tokens)] = self.eos_token_id
+        if dec_num_padding_tokens > 0:
+            label[len(dec_input_tokens)+1:] = self.pad_token_id
 
-        # Double check the size of the tensors to make sure they are all seq_len long
-        assert encoder_input.size(0) == self.src_seq_len
-        assert decoder_input.size(0) == self.tgt_seq_len
-        assert label.size(0) == self.tgt_seq_len
+        # Create masks efficiently
+        encoder_mask = (encoder_input != self.pad_token_id).unsqueeze(0).unsqueeze(0).int()
+        decoder_mask = (decoder_input != self.pad_token_id).unsqueeze(0).int() & causal_mask(self.tgt_seq_len)
 
         return {
-            "encoder_input": encoder_input,  # (seq_len)
-            "decoder_input": decoder_input,  # (seq_len)
-            "encoder_mask": (encoder_input != self.pad_token).unsqueeze(0).unsqueeze(0).int(), # (1, 1, seq_len)
-            "decoder_mask": (decoder_input != self.pad_token).unsqueeze(0).int() & causal_mask(decoder_input.size(0)), # (1, seq_len) & (1, seq_len, seq_len)
-            "label": label,  # (seq_len)
+            "encoder_input": encoder_input,  # (src_seq_len)
+            "decoder_input": decoder_input,  # (tgt_seq_len)
+            "encoder_mask": encoder_mask,    # (1, 1, src_seq_len)
+            "decoder_mask": decoder_mask,    # (1, tgt_seq_len, tgt_seq_len)
+            "label": label,                  # (tgt_seq_len)
             "src_text": src_text,
             "tgt_text": tgt_text,
         }
@@ -115,7 +111,18 @@ class SummarizationDataset(Dataset):
         else:
             # Default to beginning truncation
             return tokens[:max_len]
+
+# Create the causal mask once and cache it for reuse
+_causal_masks = {}
     
 def causal_mask(size):
+    """
+    Create a causal mask for the decoder with caching for better GPU performance.
+    """
+    if size in _causal_masks:
+        return _causal_masks[size]
+        
     mask = torch.triu(torch.ones((1, size, size)), diagonal=1).type(torch.int)
-    return mask == 0
+    mask = mask == 0
+    _causal_masks[size] = mask
+    return mask
